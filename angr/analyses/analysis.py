@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from .calling_convention import CallingConventionAnalysis
     from .decompiler.decompiler import Decompiler
     from .xrefs import XRefsAnalysis
+    from .aslr_detector import ASLRDetector
 
     AnalysisParams = ParamSpec("AnalysisParams")
 
@@ -160,6 +161,7 @@ class KnownAnalysesPlugin(typing.Protocol):
     CallingConvention: "Type[CallingConventionAnalysis]"
     Decompiler: "Type[Decompiler]"
     XRefs: "Type[XRefsAnalysis]"
+    ASLRDetector: "Type[ASLRDetector]"
 
 
 class AnalysesHubWithDefault(AnalysesHub, KnownAnalysesPlugin):
