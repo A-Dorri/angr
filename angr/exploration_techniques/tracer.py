@@ -6,6 +6,7 @@ from capstone import CS_GRP_CALL, CS_GRP_IRET, CS_GRP_JUMP, CS_GRP_RET
 
 from . import ExplorationTechnique
 from .. import BP_BEFORE, BP_AFTER, sim_options
+from ..analyses import ASLRDetector
 from ..errors import AngrTracerError, SimIRSBNoDecodeError
 
 if TYPE_CHECKING:
@@ -167,6 +168,7 @@ class Tracer(ExplorationTechnique):
         mode=TracingMode.Strict,
         aslr=True,
         follow_unsat=False,
+        aslr_detector=None
     ):
         super().__init__()
         self._trace = trace
@@ -195,24 +197,12 @@ class Tracer(ExplorationTechnique):
         self._last_block_total_count = self._trace.count(self._trace[-1])
         self._last_block_seen_count = 0
 
+        self._aslr_detector = aslr_detector or ASLRDetector(self._trace)
+
         # sanity check: copy_states must be enabled in Permissive mode since we may need to backtrack from a previous
         # state.
         if self._mode == TracingMode.Permissive and not self._copy_states:
             raise ValueError('"copy_states" must be True when tracing in permissive mode.')
-
-    def _locate_entry_point(self, angr_addr):
-        # ...via heuristics
-        indices = set()
-        threshold = 0x40000
-        while not indices and threshold > 0x2000:
-            for idx, addr in enumerate(self._trace):
-                if ((addr - angr_addr) & 0xFFF) == 0 and (idx == 0 or abs(self._trace[idx - 1] - addr) > threshold):
-                    indices.add(idx)
-
-            indices = {i for i in indices if self._filter_idx(angr_addr, i)}
-            threshold //= 2
-
-        return indices
 
     def _identify_aslr_slides(self):
         """
@@ -221,48 +211,8 @@ class Tracer(ExplorationTechnique):
         original address and address in angr back and forth
         """
         if self._aslr:
-            # if we don't know whether there is any slide, we need to identify the slides via heuristics
-            for obj in self.project.loader.all_objects:
-                # do not analyze pseudo-objects
-                if obj.binary_basename.startswith("cle##"):
-                    continue
+            self._aslr_slides = self._aslr_detector.aslr_slides
 
-                # heuristic 1: non-PIC  objects are loaded without aslr slides
-                if not obj.pic:
-                    self._aslr_slides[obj] = 0
-                    continue
-
-                # heuristic 2: library objects with custom_base_addr are loaded at the correct locations
-                if obj._custom_base_addr:
-                    l.info("%s is assumed to be loaded at the address matching the one in the trace", obj)
-                    self._aslr_slides[obj] = 0
-                    continue
-
-                # heuristic 3: entry point of an object should appear in the trace
-                possibilities = None
-                for entry in obj.initializers + ([obj.entry] if obj.is_main_bin else []):
-                    indices = self._locate_entry_point(entry)
-                    slides = {self._trace[idx] - entry for idx in indices}
-                    if possibilities is None:
-                        possibilities = slides
-                    else:
-                        possibilities.intersection_update(slides)
-
-                if possibilities is None:
-                    continue
-
-                if len(possibilities) == 0:
-                    raise AngrTracerError(
-                        "Trace does not seem to contain object initializers for %s. "
-                        "Do you want to have a Tracer(aslr=False)?" % obj
-                    )
-                if len(possibilities) == 1:
-                    self._aslr_slides[obj] = next(iter(possibilities))
-                else:
-                    raise AngrTracerError(
-                        "Trace seems ambiguous with respect to what the ASLR slides are for %s. "
-                        "This is surmountable, please open an issue." % obj
-                    )
         else:
             # if we know there is no slides, just trust the address in the loader
             for obj in self.project.loader.all_objects:
@@ -271,18 +221,6 @@ class Tracer(ExplorationTechnique):
                     continue
                 self._aslr_slides[obj] = 0
             self._current_slide = 0
-
-    def _filter_idx(self, angr_addr, idx):
-        slide = self._trace[idx] - angr_addr
-        block = self.project.factory.block(angr_addr)
-        legal_next = block.vex.constant_jump_targets
-        if legal_next:
-            return any(a + slide == self._trace[idx + 1] for a in legal_next)
-        else:
-            # the intuition is that if the first block of an initializer does an indirect jump,
-            # it's probably a call out to another binary (notably __libc_start_main)
-            # this is an awful fucking heuristic but it's as good as we've got
-            return abs(self._trace[idx] - self._trace[idx + 1]) > 0x1000
 
     def set_fd_data(self, fd_data: Dict[int, bytes]):
         """
@@ -303,7 +241,7 @@ class Tracer(ExplorationTechnique):
         self._identify_aslr_slides()
 
         if self._fast_forward_to_entry:
-            idx = self._trace.index(self._translate_state_addr(self.project.entry))
+            idx = self._trace.index(self._aslr_detector.translate_state_addr(self.project.entry))
             # step to entry point
             while simgr.one_active.addr != self.project.entry:
                 simgr.step(extra_stop_points={self.project.entry})
@@ -474,7 +412,7 @@ class Tracer(ExplorationTechnique):
         expected_addr = self._trace[deviating_trace_idx]
         current_obj = self.project.loader.find_object_containing(state.addr)
         assert current_obj is not None
-        translated_addr = self._translate_trace_addr(expected_addr, current_obj)
+        translated_addr = self._aslr_detector.translate_trace_addr(expected_addr, current_obj)
         l.info(
             "Attempt to fix a deviation: Forcing execution from %#x to %#x (instead of %#x).",
             state.addr,
@@ -573,7 +511,7 @@ class Tracer(ExplorationTechnique):
             idx -= 1  # use normal code to do the last synchronization
 
         if sync == "entry":
-            trace_addr = self._translate_state_addr(state.addr)
+            trace_addr = self._aslr_detector.translate_state_addr(state.addr)
             # this address should only ever appear once in the trace. we verified this during setup.
             idx = self._trace.index(trace_addr)
             state.globals["trace_idx"] = idx
@@ -613,7 +551,7 @@ class Tracer(ExplorationTechnique):
             elif proc.is_continuation:
                 orig_addr = self.project.loader.find_symbol(proc.display_name).rebased_addr
                 obj = self.project.loader.find_object_containing(orig_addr)
-                orig_trace_addr = self._translate_state_addr(orig_addr, obj)
+                orig_trace_addr = self._aslr_detector.translate_state_addr(orig_addr, obj)
                 if 0 <= self._trace[idx + 1] - orig_trace_addr <= 0x10000:
                     # this is fine. we do nothing and then next round
                     # it'll get handled by the is_hooked(state.history.addr) case
@@ -667,45 +605,11 @@ class Tracer(ExplorationTechnique):
         else:
             l.debug("Trace: %s/%s", state.globals["trace_idx"], len(self._trace))
 
-    def _translate_state_addr(self, state_addr, obj=None):
-        if obj is None:
-            obj = self.project.loader.find_object_containing(state_addr)
-        if obj not in self._aslr_slides:
-            raise Exception("Internal error: cannot translate address")
-        return state_addr + self._aslr_slides[obj]
-
-    def _translate_trace_addr(self, trace_addr, obj=None):
-        if obj is None:
-            for obj, slide in self._aslr_slides.items():  # pylint: disable=redefined-argument-from-local
-                if obj.contains_addr(trace_addr - slide):
-                    break
-            else:
-                raise Exception("Can't figure out which object this address belongs to")
-        if obj not in self._aslr_slides:
-            raise Exception("Internal error: object is untranslated")
-        return trace_addr - self._aslr_slides[obj]
-
     def _compare_addr(self, trace_addr, state_addr):
         if self._current_slide is not None and trace_addr == state_addr + self._current_slide:
             return True
 
-        current_bin = self.project.loader.find_object_containing(state_addr)
-        if current_bin is self.project.loader._extern_object or current_bin is self.project.loader._kernel_object:
-            return False
-        elif current_bin in self._aslr_slides:
-            self._current_slide = self._aslr_slides[current_bin]
-            return trace_addr == state_addr + self._current_slide
-        elif ((trace_addr - state_addr) & 0xFFF) == 0:
-            self._aslr_slides[current_bin] = self._current_slide = trace_addr - state_addr
-            return True
-        # error handling
-        elif current_bin:
-            raise AngrTracerError(
-                "Trace desynced on jumping into %s. "
-                "Did you load the right version of this library?" % current_bin.provides
-            )
-        else:
-            raise AngrTracerError("Trace desynced on jumping into %#x, where no library is mapped!" % state_addr)
+        return self._aslr_detector._compare_addr(trace_addr, state_addr)
 
     def _check_qemu_block_in_unicorn_block(self, state: "SimState", trace_curr_idx, state_desync_block_idx):
         """
@@ -726,7 +630,7 @@ class Tracer(ExplorationTechnique):
         big_block_end = None
         curr_block_addr = big_block_start
         while True:
-            curr_block = state.project.factory.block(self._translate_trace_addr(curr_block_addr))
+            curr_block = state.project.factory.block(self._aslr_detector.translate_trace_addr(curr_block_addr))
             curr_block_last_insn = curr_block.capstone.insns[-1]
             if any(curr_block_last_insn.group(insn_type) for insn_type in control_flow_insn_types):
                 # Found last block
@@ -757,7 +661,7 @@ class Tracer(ExplorationTechnique):
 
         control_flow_insn_types = [CS_GRP_CALL, CS_GRP_IRET, CS_GRP_JUMP, CS_GRP_RET]
 
-        prev_trace_block = state.project.factory.block(self._translate_trace_addr(self._trace[trace_curr_idx - 1]))
+        prev_trace_block = state.project.factory.block(self._aslr_detector.translate_trace_addr(self._trace[trace_curr_idx - 1]))
         for insn_type in control_flow_insn_types:
             if prev_trace_block.capstone.insns[-1].group(insn_type):
                 # Previous block ends in a control flow instruction. It is not large block different split.
@@ -767,11 +671,11 @@ class Tracer(ExplorationTechnique):
         # trace: it'll be the first block executed after a control flow instruction.
         big_block_start_addr = None
         for trace_block_idx in range(trace_curr_idx - 2, -1, -1):
-            trace_block = state.project.factory.block(self._translate_trace_addr(self._trace[trace_block_idx]))
+            trace_block = state.project.factory.block(self._aslr_detector.translate_trace_addr(self._trace[trace_block_idx]))
             trace_block_last_insn = trace_block.capstone.insns[-1]
             for insn_type in control_flow_insn_types:
                 if trace_block_last_insn.group(insn_type):
-                    big_block_start_addr = self._translate_trace_addr(self._trace[trace_block_idx + 1])
+                    big_block_start_addr = self._aslr_detector.translate_trace_addr(self._trace[trace_block_idx + 1])
                     break
 
             if big_block_start_addr is not None:
@@ -801,7 +705,7 @@ class Tracer(ExplorationTechnique):
         angr_big_block_end_addr = None
         curr_block_addr = big_block_start_addr
         while True:
-            curr_block = state.project.factory.block(self._translate_trace_addr(curr_block_addr))
+            curr_block = state.project.factory.block(self._aslr_detector.translate_trace_addr(curr_block_addr))
             curr_block_last_insn = curr_block.capstone.insns[-1]
             if any(curr_block_last_insn.group(insn_type) for insn_type in control_flow_insn_types):
                 # Found last block
@@ -813,7 +717,7 @@ class Tracer(ExplorationTechnique):
         # Let's find the address of the last bytes of the big basic block from the trace
         big_block_end_addr = None
         for trace_block_idx in range(trace_curr_idx, len(self._trace)):
-            trace_block = state.project.factory.block(self._translate_trace_addr(self._trace[trace_block_idx]))
+            trace_block = state.project.factory.block(self._aslr_detector.translate_trace_addr(self._trace[trace_block_idx]))
             trace_block_last_insn = trace_block.capstone.insns[-1]
             for insn_type in control_flow_insn_types:
                 if trace_block_last_insn.group(insn_type):
@@ -928,7 +832,7 @@ class Tracer(ExplorationTechnique):
         return self._sync(state, idx, ret_addr)
 
     def _sync(self, state, idx, addr):
-        addr_translated = self._translate_state_addr(addr)
+        addr_translated = self._aslr_detector.translate_state_addr(addr)
         try:
             sync_idx = self._trace.index(addr_translated, idx)
         except ValueError:

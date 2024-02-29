@@ -2,7 +2,7 @@ import logging
 from itertools import islice
 
 from . import ExplorationTechnique
-
+from ..analyses import ASLRDetector
 
 l = logging.getLogger(name=__name__)
 
@@ -16,7 +16,7 @@ class DrillerCore(ExplorationTechnique):
     'diverted' stash.
     """
 
-    def __init__(self, trace, fuzz_bitmap=None):
+    def __init__(self, trace, fuzz_bitmap=None, aslr_detector=None):
         """
         :param trace      : The basic block trace.
         :param fuzz_bitmap: AFL's bitmap of state transitions. Defaults to saying every transition is worth satisfying.
@@ -28,6 +28,8 @@ class DrillerCore(ExplorationTechnique):
 
         # Set of encountered basic block transitions.
         self.encounters = set()
+
+        self._aslr_detector = aslr_detector or ASLRDetector(self.trace)
 
     def setup(self, simgr):
         self.project = simgr._project
@@ -42,13 +44,13 @@ class DrillerCore(ExplorationTechnique):
         if "missed" in simgr.stashes and simgr.missed:
             # A bit ugly, might be replaced by tracer.predecessors[-1] or crash_monitor.last_state.
             prev_addr = simgr.one_missed.history.bbl_addrs[-1]
-            prev_loc = prev_addr
+            prev_loc = self._aslr_detector.translate_state_addr(prev_addr)
             prev_loc = (prev_loc >> 4) ^ (prev_loc << 8)
             prev_loc &= len(self.fuzz_bitmap) - 1
             prev_loc = prev_loc >> 1
 
             for state in simgr.missed:
-                cur_loc = state.addr
+                cur_loc = self._aslr_detector.translate_state_addr(state.addr)
                 cur_loc = (cur_loc >> 4) ^ (cur_loc << 8)
                 cur_loc &= len(self.fuzz_bitmap) - 1
 
